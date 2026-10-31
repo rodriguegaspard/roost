@@ -13,6 +13,10 @@ INPUT is either:
 By default new inputs are appended to the playlist and playback starts.
 Use --append to queue without starting, --replace to replace the current
 item. HOST defaults to $PLAY_HOST, or "balthazar".
+
+The remote upload cache lives in /srv/remote-mpv/uploads and is cleared
+at the start of every invocation. The remote user must have write access
+to that directory.
 """
 from __future__ import annotations
 
@@ -21,13 +25,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 URL_SCHEMES = {"http", "https", "rtsp", "rtmp", "rtmps", "mms", "magnet", "ytdl"}
-REMOTE_UPLOAD_DIR = ".cache/remote-mpv/uploads"   # relative to remote $HOME
+REMOTE_UPLOAD_DIR = "/srv/remote-mpv/uploads"
 
 SSH_OPTS = [
-    "-o", "BatchMode=yes",
-    "-o", "ConnectTimeout=10",
-    "-o", "ServerAliveInterval=30",
-]
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=30",
+        ]
 
 
 def is_url(s: str) -> bool:
@@ -48,13 +52,19 @@ def main() -> int:
 
     def ssh(cmd: str, *, input: bytes | None = None, check: bool = True
             ) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["ssh", *SSH_OPTS, host, cmd],
-            input=input, capture_output=True, check=check,
-        )
+        r = subprocess.run(
+                ["ssh", *SSH_OPTS, host, cmd],
+                input=input, capture_output=True,
+                )
+        if check and r.returncode != 0:
+            stderr = r.stderr.decode(errors="replace").strip()
+            raise subprocess.CalledProcessError(
+                    r.returncode, r.args, output=r.stdout, stderr=stderr,
+                    )
+        return r
 
     def ipc(*cmd: str) -> dict:
-        r = ssh("~/.local/bin/mpv-ipc " + " ".join(shlex.quote(a) for a in cmd))
+        r = ssh("~/.local/bin/mpv-ipc --raw " + " ".join(shlex.quote(a) for a in cmd))
         return json.loads(r.stdout.decode() or "{}")
 
     def daemon_alive() -> bool:
@@ -75,37 +85,53 @@ def main() -> int:
             if daemon_alive():
                 return
         raise SystemExit(
-            "play: remote mpv daemon failed to start "
-            "(check /tmp/mpv-daemon.log on the remote)"
-        )
+                "play: remote mpv daemon failed to start "
+                "(check /tmp/mpv-daemon.log on the remote)"
+                )
 
-    # Fetch remote $HOME once so we can build absolute paths.
-    remote_home = ssh("echo $HOME").stdout.decode().strip()
+    def clean_cache() -> None:
+        q = shlex.quote(REMOTE_UPLOAD_DIR)
+        parent = REMOTE_UPLOAD_DIR.rsplit("/", 1)[0]
+        try:
+            ssh(f"mkdir -p {q} && find {q} -mindepth 1 -delete")
+        except subprocess.CalledProcessError as e:
+            sys.stderr.write(
+                    f"play: cannot prepare remote cache {REMOTE_UPLOAD_DIR}.\n"
+                    f"  ssh said: {e.stderr}\n"
+                    f"  One-time setup on the remote ({host}):\n"
+                    f"    sudo mkdir -p {REMOTE_UPLOAD_DIR}\n"
+                    f"    sudo chown -R \"$USER\" {parent}\n"
+                    )
+            raise SystemExit(1)
 
     def upload(local: Path) -> str:
         abs_path = local.resolve()
         h = hashlib.sha256(str(abs_path).encode()).hexdigest()[:12]
-        remote_name = f"{h}-{abs_path.name}"
-        remote_rel = f"{REMOTE_UPLOAD_DIR}/{remote_name}"
-
-        ssh(f"mkdir -p ~/{REMOTE_UPLOAD_DIR}")
-        subprocess.run(
-            ["scp", *SSH_OPTS, "-q", str(abs_path), f"{host}:{remote_rel}"],
-            check=True,
-        )
-        return f"{remote_home}/{remote_rel}"
+        remote_name = f"{h}{abs_path.suffix}"
+        remote_path = f"{REMOTE_UPLOAD_DIR}/{remote_name}"
+        with open(abs_path, "rb") as f:
+            subprocess.run(
+                    ["ssh", *SSH_OPTS, host, f"cat > {shlex.quote(remote_path)}"],
+                    stdin=f,
+                    check=True,
+                    )
+        return remote_path
 
     ensure_daemon()
+    if any(not is_url(i) for i in args.inputs):
+        clean_cache()
 
     for inp in args.inputs:
         if is_url(inp):
-            target = inp
-        else:
-            p = Path(inp)
-            if not p.is_file():
-                print(f"play: not a file or URL: {inp}", file=sys.stderr)
-                return 1
-            target = upload(p)
+            ipc("loadfile", inp, mpv_mode)
+            continue
+
+        p = Path(inp)
+        if not p.is_file():
+            print(f"play: not a file or URL: {inp}", file=sys.stderr)
+            return 1
+
+        target = upload(p)
         ipc("loadfile", target, mpv_mode)
 
     return 0
